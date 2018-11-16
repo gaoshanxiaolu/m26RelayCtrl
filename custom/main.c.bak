@@ -1,0 +1,1047 @@
+
+/*****************************************************************************
+*  Copyright Statement:
+*  --------------------
+*  This software is protected by Copyright and the information contained
+*  herein is confidential. The software may not be copied and the information
+*  contained herein may not be used or disclosed except with the written
+*  permission of Quectel Co., Ltd. 2013
+*
+*****************************************************************************/
+/*****************************************************************************
+ *
+ * Filename:
+ * ---------
+ *   main.c
+ *
+ * Project:
+ * --------
+ *   OpenCPU
+ *
+ * Description:
+ * ------------
+ *   This app demonstrates how to send AT command with RIL API, and transparently
+ *   transfer the response through MAIN UART. And how to use UART port.
+ *   Developer can program the application based on this example.
+ *
+ ****************************************************************************/
+#ifdef __CUSTOMER_CODE__
+#include "custom_feature_def.h"
+#include "ril.h"
+#include "ril_util.h"
+#include "ril_telephony.h"
+#include "ql_stdlib.h"
+#include "ql_error.h"
+#include "ql_trace.h"
+#include "ql_uart.h"
+#include "ql_system.h"
+#include "ql_gpio.h"
+#include "ql_timer.h"
+#include "ril_network.h"
+#include "ql_gprs.h"
+#include "ql_socket.h"
+
+
+#define DEBUG_ENABLE 1
+#if DEBUG_ENABLE > 0
+#define DEBUG_PORT  UART_PORT1
+#define DBG_BUF_LEN   512
+static char DBG_BUFFER[DBG_BUF_LEN];
+#define APP_DEBUG(FORMAT,...) {\
+    Ql_memset(DBG_BUFFER, 0, DBG_BUF_LEN);\
+    Ql_sprintf(DBG_BUFFER,FORMAT,##__VA_ARGS__); \
+    if (UART_PORT2 == (DEBUG_PORT)) \
+    {\
+        Ql_Debug_Trace(DBG_BUFFER);\
+    } else {\
+        Ql_UART_Write((Enum_SerialPort)(DEBUG_PORT), (u8*)(DBG_BUFFER), Ql_strlen((const char *)(DBG_BUFFER)));\
+    }\
+}
+#else
+#define APP_DEBUG(FORMAT,...)
+#endif
+
+
+
+/************************************************************************/
+/* Definition for GPRS PDP context                                      */
+/************************************************************************/
+
+static ST_GprsConfig m_GprsConfig = {
+    "CMNET",    // APN name
+    "",         // User name for APN
+    "",         // Password for APN
+    0,
+    NULL,
+    NULL,
+};
+
+/************************************************************************/
+/* Definition for Server IP Address and Socket Port Number              */
+/************************************************************************/
+
+//static u8 m_SrvHostName[100] = "greenpower.sheyutech.com\0";
+//static u8 m_SrvHostName[100] = "www.baidu.com\0";
+static u8 m_SrvHostName[100] = "dog.autobed.cn\0";
+static u8  m_SrvIpAddr[4] = {0};
+static u32 m_SrvIpAddrU32;
+static u16 m_SrvPort = 9018;
+//static char m_SimId[30]={0};
+
+#define  SEND_BUFFER_LEN  14
+#define  RECV_BUFFER_LEN  23
+#define  RECV_BUFFER_STOP_LEN  19
+static u8 m_send_buf[SEND_BUFFER_LEN];
+static u8 m_recv_buf[RECV_BUFFER_LEN];
+
+static s32 m_GprsActState    = 0;   // GPRS PDP activation state, 0= not activated, 1=activated
+static s32 m_SocketId        = -1;  // Store socket Id that returned by Ql_SOC_Create()
+static s32 m_SocketConnState = 0;   // Socket connection state, 0= disconnected, 1=connected
+static s32 m_pdpCntxtId;
+
+//timer param
+#define UDP_TIMER_TXID         (TIMER_ID_USER_START + 10)
+#define UDP_TIMER_CTRL         (TIMER_ID_USER_START + 11)
+#define UDP_TIMER_TXPERIOD     10000
+#define UDP_TIMER_CTRLPERIOD   1000
+
+// Define GPIO pin
+static Enum_PinName m_gpioMotorP = PINNAME_RXD_AUX;   // 马达转向
+static Enum_PinName m_gpioMotorN = PINNAME_TXD_AUX;   // 马达转向
+static Enum_PinName m_gpioLight  = PINNAME_NETLIGHT;  // 控制灯
+
+// Simcard Number
+static char m_PhoneNumber[30] = "\0";
+static char m_IMEI[30] = "\0";
+
+// stage state
+static u8 m_ProcessStage = 0;
+
+
+// 0:close;1:postive;2:negative
+#define        DIR_POSITIVE        1
+#define        DIR_NEGATIVE        2
+#define        CTRL_STOP           0
+#define        CTRL_START          1
+static u8 m_MotorWd = CTRL_STOP;
+static u8 m_LightWd = CTRL_STOP;
+
+// motor cnt
+static u8 m_CtrlCnt = 0;
+static u8 m_SecondCnt = 0;
+static u8 m_MinuteCnt = 0;
+
+static u8 m_MotorP_Cnt = 0;
+static u8 m_MotorN_Cnt = 0;
+static u8 m_Work_Minute = 0;
+
+static u8 m_StartCtrl = CTRL_STOP;
+
+static u8 m_newCmd[5]={0};
+
+/************************************************************************/
+/* Declarations for GPRS and UDP socket callback                        */
+/************************************************************************/
+
+static void Callback_GPRS_Deactived(u8 contextId, s32 errCode, void* customParam);
+
+static void Callback_Socket_Connect(s32 socketId, s32 errCode, void* customParam);
+static void Callback_Socket_Close(s32 socketId, s32 errCode, void* customParam);
+static void Callback_Socket_Read(s32 socketId, s32 errCode, void* customParam);
+static void Callback_Socket_Write(s32 socketId, s32 errCode, void* customParam);
+
+static ST_PDPContxt_Callback callback_gprs_func =
+{
+     NULL,
+     Callback_GPRS_Deactived
+};
+static ST_SOC_Callback    callback_soc_func =
+{
+    Callback_Socket_Connect,
+    Callback_Socket_Close,
+    NULL,
+    Callback_Socket_Read,
+    Callback_Socket_Write
+};
+
+static void GPRS_UDP_Init(void);
+static u8 cal_Xor(u8* startPtr,u8 len);
+static void TxData_Pack(void);
+//static void GPRS_UDP_TxRx(void);
+
+static void CallBack_UART_Hdlr(Enum_SerialPort port, Enum_UARTEventType msg, bool level, void* customizedPara)
+{
+}
+
+static void callback_GetIpByName(u8 contexId, u8 requestId, s32 errCode, u32 ipAddrCnt, u32* ipAddr);
+
+static s32 ATRsp_CNUM_Handler(char* line, u32 len, void* param);
+static s32 RIL_SIM_GetSNID(char* cnum);
+
+
+//timer callback function
+static void Callback_Timer(u32 timerId, void* param);
+
+
+static void Chk_StartPack();
+
+
+void proc_main_task(s32 taskId)
+{
+    s32 ret;
+    ST_MSG msg;
+
+    // Register & open UART port
+    Ql_UART_Register(UART_PORT1, CallBack_UART_Hdlr, NULL);
+    Ql_UART_Open(UART_PORT1, 115200, FC_NONE);
+    APP_DEBUG("<--Start App procedure-->\r\n");
+
+    // GPIO Initial
+    ret=Ql_GPIO_Init(m_gpioMotorP, PINDIRECTION_OUT, PINLEVEL_LOW, PINPULLSEL_PULLUP);
+    ret=Ql_GPIO_Init(m_gpioMotorN, PINDIRECTION_OUT, PINLEVEL_LOW, PINPULLSEL_PULLUP);
+    ret=Ql_GPIO_Init(m_gpioLight,  PINDIRECTION_OUT, PINLEVEL_LOW, PINPULLSEL_PULLUP);
+
+    // APP_DEBUG("<-- Get the GPIO direction: %d -->\r\n", Ql_GPIO_GetDirection(m_gpioMotorP));
+    // APP_DEBUG("<-- Get the GPIO direction: %d -->\r\n", Ql_GPIO_GetDirection(m_gpioMotorN));
+    // APP_DEBUG("<-- Get the GPIO level value: %d -->\r\n\r\n", Ql_GPIO_GetLevel(m_gpioMotorP));
+    // APP_DEBUG("<-- Get the GPIO level value: %d -->\r\n\r\n", Ql_GPIO_GetLevel(m_gpioMotorN));
+    // Ql_GPIO_SetLevel(m_gpioMotorP, PINLEVEL_HIGH);
+    // Ql_GPIO_SetLevel(m_gpioMotorN, PINLEVEL_LOW);
+    // Ql_Sleep(500);
+    // Ql_GPIO_SetLevel(m_gpioMotorP, PINLEVEL_LOW);
+    // Ql_GPIO_SetLevel(m_gpioMotorN, PINLEVEL_LOW);
+    // Ql_Sleep(500);
+    // Ql_GPIO_SetLevel(m_gpioMotorP, PINLEVEL_LOW);
+    // Ql_GPIO_SetLevel(m_gpioMotorN, PINLEVEL_HIGH);
+
+    APP_DEBUG("<-- Start Timer -->\r\n");
+    ret=Ql_Timer_Register(UDP_TIMER_TXID, Callback_Timer, NULL);
+    ret=Ql_Timer_Register(UDP_TIMER_CTRL, Callback_Timer, NULL);
+    ret=Ql_Timer_Start(UDP_TIMER_TXID, UDP_TIMER_TXPERIOD, TRUE);
+    ret=Ql_Timer_Start(UDP_TIMER_CTRL, UDP_TIMER_CTRLPERIOD, TRUE);
+
+    // Start message loop of this task
+    while (TRUE)
+    {
+            // Retrieve a message from the message queue of this task.
+            // This task will pend here if no message in the message queue, till a new message arrives.
+            Ql_OS_GetMessage(&msg);
+
+
+            // Handle the received message
+            switch (msg.message)
+            {
+                // Application will receive this message when OpenCPU RIL starts up.
+                // Then application needs to call Ql_RIL_Initialize to launch the initialization of RIL.
+            case MSG_ID_RIL_READY:
+                APP_DEBUG("<-- RIL is ready -->\r\n");
+                Ql_RIL_Initialize();
+                //
+                // After RIL initialization, developer may call RIL-related APIs in the .h files in the directory of SDK\ril\inc
+                // RIL-related APIs may simplify programming, and quicken the development.
+                //
+                break;
+
+                // Handle URC messages.
+                // URC messages include "module init state", "CFUN state", "SIM card state(change)",
+                // "GSM network state(change)", "GPRS network state(change)" and other user customized URC.
+            case MSG_ID_URC_INDICATION:
+                switch (msg.param1)
+                {
+                    // URC for module initialization state
+                case URC_SYS_INIT_STATE_IND:
+                    APP_DEBUG("<-- Sys Init Status %d -->\r\n", msg.param2);
+                    //if (SYS_STATE_SMSOK == msg.param2)
+                    //{
+                    //    // SMS option has been initialized, and application can program SMS
+                    //    APP_DEBUG("<-- Application can program SMS -->\r\n");
+                    //}
+                    break;
+
+                    // URC for SIM card state(change)
+                case URC_SIM_CARD_STATE_IND:
+                    if (SIM_STAT_READY == msg.param2)
+                    {
+                        APP_DEBUG("<-- SIM card is ready -->\r\n");
+                    }else{
+                        APP_DEBUG("<-- SIM card is not available, cause:%d -->\r\n", msg.param2);
+                        /* cause: 0 = SIM card not inserted
+                         *        2 = Need to input PIN code
+                         *        3 = Need to input PUK code
+                         *        9 = SIM card is not recognized
+                         */
+                    }
+                    break;
+
+                    // URC for GPRS network state(change).
+                    // Application receives this URC message when GPRS network state changes, such as register to
+                    // GPRS network during booting, GSM drops down.
+                case URC_GPRS_NW_STATE_IND:
+                    if (NW_STAT_REGISTERED == msg.param2 || NW_STAT_REGISTERED_ROAMING == msg.param2)
+                    {
+                        APP_DEBUG("<-- Module has registered to GPRS network -->\r\n");
+
+                        // Module has registered to GPRS network, and app may start to activate PDP and program TCP
+
+                        GPRS_UDP_Init();
+                    }else{
+                        APP_DEBUG("<-- GPRS network status:%d -->\r\n", msg.param2);
+                        /* status: 0 = Not registered, module not currently search a new operator
+                         *         2 = Not registered, but module is currently searching a new operator
+                         *         3 = Registration denied
+                         */
+
+                        // If GPRS drops down and currently socket connection is on line, app should close socket
+                        // and check signal strength. And try to reset the module.
+                        if (NW_STAT_NOT_REGISTERED == msg.param2 && m_GprsActState)
+                        {// GPRS drops down
+                            u32 rssi;
+                            u32 ber;
+                            s32 nRet = RIL_NW_GetSignalQuality(&rssi, &ber);
+                            APP_DEBUG("<-- Signal strength:%d, BER:%d -->\r\n", rssi, ber);
+                        }
+                    }
+                    break;
+                default:
+                    APP_DEBUG("<-- Other URC: type=%d\r\n", msg.param1);
+                    break;
+                }
+
+            default:
+                break;
+
+            }
+            // else if (2 == m_ProcessStage)
+            // {
+            //     TxData_Pack();
+            // }
+            // else
+            // {
+            //     GPRS_UDP_TxRx();
+            // }
+    }
+
+    APP_DEBUG("<-- END App procedure-->\r\n");
+}
+
+
+// Activate GPRS and program TCP.
+static void GPRS_UDP_Init(void)
+{
+    s32 ret;
+
+    if (0 == m_ProcessStage)
+    {
+        //1. Register GPRS callback
+        m_pdpCntxtId = Ql_GPRS_GetPDPContextId();
+        if (GPRS_PDP_ERROR == m_pdpCntxtId)
+        {
+            APP_DEBUG("No PDP context is available\r\n");
+            return ret;
+        }
+
+
+        //---------------------test----------------------------//
+        // Set pdp context
+        // ret = RIL_NW_SetGPRSContext(m_pdpCntxtId);
+        // APP_DEBUG("<-- Set GPRS PDP context, ret=%d -->\r\n", ret);
+        //
+        // // Set APN
+        // ret = RIL_NW_SetAPN(1, APN, USERID, PASSWD);
+        // APP_DEBUG("<-- Set GPRS APN, ret=%d -->\r\n", ret);
+        //---------------------test----------------------------//
+
+
+
+        ret = Ql_GPRS_Register(m_pdpCntxtId, &callback_gprs_func, NULL);
+        if (GPRS_PDP_SUCCESS == ret)
+        {
+            APP_DEBUG("<-- Register GPRS callback function -->\r\n");
+        }
+        else if (GPRS_PDP_ALREADY == ret)
+        {
+            APP_DEBUG("<--GPRS callback function has already been registered,ret=%d.-->\r\n",ret);
+        }
+        else{
+            APP_DEBUG("<-- Fail to register GPRS, cause=%d. -->\r\n", ret);
+            return;
+        }
+
+        //2. Configure PDP
+        ret = Ql_GPRS_Config(m_pdpCntxtId, &m_GprsConfig);
+        if (GPRS_PDP_SUCCESS == ret)
+        {
+            APP_DEBUG("<-- Configure PDP context -->\r\n");
+        }else{
+            APP_DEBUG("<-- Fail to configure GPRS PDP, cause=%d. -->\r\n", ret);
+            return;
+        }
+
+        //3. Activate GPRS PDP context
+        APP_DEBUG("<-- Activating GPRS... -->\r\n");
+        ret = Ql_GPRS_ActivateEx(m_pdpCntxtId, TRUE);
+        if (ret == GPRS_PDP_SUCCESS)
+        {
+            m_GprsActState = 1;
+            APP_DEBUG("<-- Activate GPRS successfully. -->\r\n\r\n");
+        }
+        else if (GPRS_PDP_ALREADY == ret)
+        {
+            APP_DEBUG("<--  GPRS already Activate successfully. -->\r\n\r\n");
+        }
+        else{
+            APP_DEBUG("<-- Fail to activate GPRS, cause=%d. -->\r\n\r\n", ret);
+            return;
+        }
+
+        u8 ip_addr[5];
+        Ql_memset(ip_addr, 0, 5);
+        ret = Ql_GPRS_GetLocalIPAddress(m_pdpCntxtId, (u32 *)ip_addr);
+        if (ret == GPRS_PDP_SUCCESS)
+        {
+            APP_DEBUG("<--Get Local Ip successfully,Local Ip=%d.%d.%d.%d,U32Addr=%x-->\r\n",ip_addr[0],ip_addr[1],ip_addr[2],ip_addr[3],(u32)ip_addr);
+        }else
+        {
+            APP_DEBUG("<--Get Local Ip failure,ret=%d.-->\r\n",ret);
+        }
+
+        //4. Register Socket callback
+        ret = Ql_SOC_Register(callback_soc_func, NULL);
+        if (SOC_SUCCESS == ret)
+        {
+            APP_DEBUG("<-- Register socket callback function successfully.  -->\r\n");
+        }else{
+            APP_DEBUG("<-- Fail to register socket callback, cause=%d. -->\r\n", ret);
+            return;
+        }
+
+        //5. Create socket
+        m_SocketId = Ql_SOC_Create(m_pdpCntxtId, SOC_TYPE_UDP);
+        if (m_SocketId >= 0)
+        {
+            APP_DEBUG("<-- Create socket successfully, socket id=%d. -->\r\n", m_SocketId);
+            m_ProcessStage = 1;
+        }else{
+            APP_DEBUG("<-- Fail to create socket, cause=%d. -->\r\n", m_SocketId);
+            return;
+        }
+    }
+
+
+
+    //u8 ip_addr[4];
+    //Ql_memset(ip_addr, 0, sizeof(ip_addr));
+    //ret = Ql_GPRS_GetLocalIPAddress(0, (u32 *)ip_addr);
+    //if (GPRS_PDP_SUCCESS == ret)
+    //{
+    //    APP_DEBUG("<-- Get Local Ip successfully,Local Ip=%d.%d.%d.%d -->\r\n", ip_addr[0],ip_addr[1],ip_addr[2],ip_addr[3]);
+    //}else{
+    //    APP_DEBUG("<-- Fail to get Local Ip address, cause=%d. -->\r\n", ret);
+    //}
+
+
+    if (1 == m_ProcessStage)
+    {
+        //6. Connect to server
+        {
+            //6.1 Convert DNS name to IP address.
+            u8 m_ReqId;
+            ret = Ql_IpHelper_GetIPByHostName(m_pdpCntxtId, m_ReqId, m_SrvHostName,callback_GetIpByName);
+
+            if (SOC_SUCCESS == ret)
+            {
+              APP_DEBUG("<-- Convert DNS Name to IP successfully,m_ipaddress=%d,%d,%d,%d -->\r\n",m_SrvIpAddr[0],m_SrvIpAddr[1],m_SrvIpAddr[2],m_SrvIpAddr[3]);
+            }
+            else
+            {
+              return;
+            }
+        }
+    }
+}
+
+
+static u8 cal_Xor(u8* startPtr,u8 len)
+{
+     u8 res = 0;
+     for(int i=0;i<len;i++)
+     {
+         res= res ^ (*startPtr++);
+     }
+     return res;
+}
+static void TxData_Pack(void)
+{
+    s32 ret;
+    //u8 m_SimId[30]={0};
+    // u32 rssi;
+    // u32 ber;
+    // s32 nRet = RIL_NW_GetSignalQuality(&rssi, &ber);
+    // APP_DEBUG("<-- Signal strength:%d, BER:%d -->\r\n", rssi, ber);
+
+
+    APP_DEBUG("<-- get IMEI number... -->\r\n");
+    //Ql_memset(m_PhoneNumber, 0x0, sizeof(m_PhoneNumber));
+    //gets the CCID of SIM card
+    //ret = RIL_SIM_GetCCID(m_SimId);
+    //APP_DEBUG("<--SimId: %s -->\r\n",m_SimId);
+    //ret = RIL_SIM_GetSNID(m_PhoneNumber);
+    //Ql_strcpy(m_PhoneNumber,"13012345678\0");
+    //APP_DEBUG("<--SimId: %s , ret : %d-->\r\n",m_PhoneNumber,ret);
+    
+    ret = RIL_GetIMEI(m_IMEI);
+    APP_DEBUG("<-- IMEI: %s , ret : %d-->\r\n",m_IMEI,ret);
+}
+
+// static void GPRS_UDP_TxRx(void)
+// {
+//
+//     s32 u32 = 1;
+//     APP_DEBUG("<-- Start to Receive Data from server.. -->\r\n");
+    //Ql_Sleep(3000);
+    //7. Send data to socket
+    // {
+    //     //7.1 Send data
+    //     char pchData[200];
+    //     s32  dataLen = 0;
+    //     u64  ackNum = 0;
+    //     Ql_memset(pchData, 0x0, sizeof(pchData));
+    //     dataLen = Ql_sprintf(pchData + dataLen, "%s", "A B C D E F G");
+    //     APP_DEBUG("<-- Sending data(len=%d): %s-->\r\n", dataLen, pchData);
+    //     ret = Ql_SOC_Send(m_SocketId, (u8*)pchData, dataLen);
+    //     if (ret == dataLen)
+    //     {
+    //         APP_DEBUG("<-- Send socket data successfully. --> \r\n");
+    //     }else{
+    //         APP_DEBUG("<-- Fail to send socket data. --> \r\n");
+    //         Ql_SOC_Close(m_SocketId);
+    //         return;
+    //     }
+    //
+    //     //7.2 Check ACK number
+    //     do
+    //     {
+    //         ret = Ql_SOC_GetAckNumber(m_SocketId, &ackNum);
+    //         APP_DEBUG("<-- Current ACK Number:%llu/%d --> \r\n", ackNum, dataLen);
+    //         Ql_Sleep(500);
+    //     } while (ackNum != dataLen);
+    //     APP_DEBUG("<-- Server has received all data --> \r\n");
+    // }
+/*
+    //8. Close socket
+    ret = Ql_SOC_Close(m_SocketId);
+    APP_DEBUG("<-- Close socket[%d], cause=%d --> \r\n", m_SocketId, ret);
+
+    //9. Deactivate GPRS
+    APP_DEBUG("<-- Deactivating GPRS... -->\r\n");
+    ret = Ql_GPRS_DeactivateEx(m_pdpCntxtId, TRUE);
+    APP_DEBUG("<-- Deactivated GPRS, cause=%d -->\r\n\r\n", ret);
+*/
+    //APP_DEBUG("< Finish >\r\n");
+
+//}
+
+
+static void Callback_Timer(u32 timerId, void* param)
+{
+    static u8 m_CtrlCount = 0;
+    if (UDP_TIMER_CTRL == timerId)
+    {   
+    	  // motor and light initial.
+        if (2 == m_ProcessStage)
+        {
+            //u8 * p_cnt = (u8 *)param;
+            APP_DEBUG("<-- timer1: ctrl motor and light,  cnt = %d\r\n", m_CtrlCnt);
+            
+            if (0 == m_CtrlCnt)
+            {
+                Ql_GPIO_SetLevel(m_gpioMotorP, PINLEVEL_HIGH);
+            }
+            
+            if (1 == m_CtrlCnt)
+            {
+                Ql_GPIO_SetLevel(m_gpioMotorP, PINLEVEL_LOW);
+            }
+            
+            if (2 == m_CtrlCnt)
+            {
+                Ql_GPIO_SetLevel(m_gpioMotorN, PINLEVEL_HIGH);
+            }
+            if (3 == m_CtrlCnt)
+            {
+                Ql_GPIO_SetLevel(m_gpioMotorN, PINLEVEL_LOW);
+            }
+            
+            if (0 == Ql_GPIO_GetLevel(m_gpioLight))
+            {
+                Ql_GPIO_SetLevel(m_gpioLight, PINLEVEL_HIGH);
+                APP_DEBUG("<-- light: high. -->\r\n");
+            }
+            else
+            {
+                Ql_GPIO_SetLevel(m_gpioLight, PINLEVEL_LOW);
+                APP_DEBUG("<-- light: low. -->\r\n");
+            }
+            
+            if (6 == m_CtrlCnt)
+            {
+                //Ql_GPIO_SetLevel(m_gpioLight, PINLEVEL_LOW);
+                m_ProcessStage = 3;
+                m_CtrlCnt=-1;
+                APP_DEBUG("<-- timer1: stop. -->\r\n");
+            }
+            
+            m_CtrlCnt = m_CtrlCnt + 1;
+            if (20 <= m_CtrlCnt)
+            {
+                m_CtrlCnt = 20;
+            }
+        }
+        
+        
+        if (3 == m_ProcessStage)
+        {
+             // fix new cmd
+             if (m_newCmd[0] == 0x33)
+             {
+             	   m_newCmd[0] = 0;
+             	   
+             	   m_MotorP_Cnt = m_newCmd[1];
+                 m_MotorN_Cnt = m_newCmd[2];
+                 if ((0 == m_newCmd[3]) || (1 == m_newCmd[3]))
+                 {
+                     m_LightWd = m_newCmd[3];
+                 }
+                 m_Work_Minute = m_newCmd[4];
+                 
+                 m_CtrlCnt = 0;
+                 m_SecondCnt = 0;
+                 m_MinuteCnt = 0;
+                 m_MotorWd = DIR_POSITIVE;
+                 m_StartCtrl = CTRL_START;
+             }
+             
+             if (m_newCmd[0] == 0x55)
+             {
+                 m_newCmd[0] = 0;
+                 m_StartCtrl = CTRL_STOP;
+                 m_LightWd = CTRL_STOP;
+                 m_CtrlCnt = 0;
+             }
+             
+             
+             // fix start stop stat
+             if (m_MinuteCnt >= m_Work_Minute)
+             {
+                  m_StartCtrl = CTRL_STOP;
+             }
+             
+             if (CTRL_STOP == m_StartCtrl)
+             {
+             	   m_MotorWd = CTRL_STOP;
+             	   m_LightWd = CTRL_STOP;
+             	   
+             	   if (1 == Ql_GPIO_GetLevel(m_gpioMotorN))
+                       Ql_GPIO_SetLevel(m_gpioMotorN, PINLEVEL_LOW);
+                     
+                   Ql_Sleep(20);    
+                 
+                   if (1 == Ql_GPIO_GetLevel(m_gpioMotorP))
+                       Ql_GPIO_SetLevel(m_gpioMotorP, PINLEVEL_LOW);
+                     
+             	   //if the network is good, the light flash in 3s interval
+             	   m_CtrlCount = m_CtrlCnt/3;//light on 3s, off 3s
+                   APP_DEBUG("<-- m_CtrlCount:m_CtrlCount=%d,m_CtrlCnt=%d,m_CtrlCount-2=%d. -->\r\n",m_CtrlCount,m_CtrlCnt,(m_CtrlCount%2));
+                   if((m_CtrlCount%2) ==0)
+                   {
+             	     if (1 == Ql_GPIO_GetLevel(m_gpioLight))
+             	     {
+             	        Ql_GPIO_SetLevel(m_gpioLight, PINLEVEL_LOW);
+                        APP_DEBUG("<-- light: low. -->\r\n");
+                     }
+                   }
+                   else
+                   {
+             	        if (0 == Ql_GPIO_GetLevel(m_gpioLight))
+             	        {
+             	           Ql_GPIO_SetLevel(m_gpioLight, PINLEVEL_HIGH);
+                           APP_DEBUG("<-- light: high. -->\r\n");
+                        }
+                   }
+             }
+             else
+             {
+                 if (DIR_POSITIVE == m_MotorWd && m_CtrlCnt >= m_MotorP_Cnt)
+                 {
+                     m_CtrlCnt = 0;
+                     m_MotorWd = DIR_NEGATIVE;
+                     Ql_GPIO_SetLevel(m_gpioMotorP, PINLEVEL_LOW);
+                     Ql_Sleep(20);
+                     Ql_GPIO_SetLevel(m_gpioMotorN, PINLEVEL_HIGH);
+                 }
+                 else if (DIR_NEGATIVE == m_MotorWd && m_CtrlCnt >= m_MotorN_Cnt)
+                 {
+                     m_CtrlCnt = 0;
+                     m_MotorWd = DIR_POSITIVE;
+                     Ql_GPIO_SetLevel(m_gpioMotorN, PINLEVEL_LOW);
+                     Ql_Sleep(20);
+                     Ql_GPIO_SetLevel(m_gpioMotorP, PINLEVEL_HIGH);
+                 }
+                 
+                 if ((CTRL_STOP == m_LightWd) && (1 == Ql_GPIO_GetLevel(m_gpioLight)))
+             {
+                 Ql_GPIO_SetLevel(m_gpioLight, PINLEVEL_LOW);
+             }
+
+             if ((CTRL_START == m_LightWd) && (0 == Ql_GPIO_GetLevel(m_gpioLight)))
+             {
+                 Ql_GPIO_SetLevel(m_gpioLight, PINLEVEL_HIGH);
+             }
+             
+                 if (60 <= m_SecondCnt)
+                 {
+                     m_MinuteCnt = m_MinuteCnt + 1;
+                     m_SecondCnt = 0;
+                 }
+                 else
+                 {
+                     m_SecondCnt = m_SecondCnt + 1;
+                 }
+                 
+                 
+                 
+                 APP_DEBUG("<-- Ctrlcnt=%d, SecondCnt = %d,mincnt = %d,m_MotorWd = %d, Max_min=%d-->\r\n",m_CtrlCnt, m_SecondCnt,m_MinuteCnt,m_MotorWd,m_Work_Minute);
+             }
+             
+             //this count increase no matter in start or stop state
+             m_CtrlCnt = m_CtrlCnt + 1;
+             
+             // light and motor ctrl
+          /*   if ((CTRL_STOP == m_LightWd) && (1 == Ql_GPIO_GetLevel(m_gpioLight)))
+             {
+                 Ql_GPIO_SetLevel(m_gpioLight, PINLEVEL_LOW);
+             }
+
+             if ((CTRL_START == m_LightWd) && (0 == Ql_GPIO_GetLevel(m_gpioLight)))
+             {
+                 Ql_GPIO_SetLevel(m_gpioLight, PINLEVEL_HIGH);
+             }
+             
+             if (DIR_POSITIVE == m_MotorWd)
+             {
+                 if (0 == Ql_GPIO_GetLevel(m_gpioMotorP))
+                     Ql_GPIO_SetLevel(m_gpioMotorP, PINLEVEL_HIGH);
+                     
+                 Ql_Sleep(20);    
+                 
+                 if (1 == Ql_GPIO_GetLevel(m_gpioMotorN))
+                     Ql_GPIO_SetLevel(m_gpioMotorN, PINLEVEL_LOW);
+             }
+             else if (DIR_NEGATIVE == m_MotorWd)
+             {
+                 if (0 == Ql_GPIO_GetLevel(m_gpioMotorN))
+                     Ql_GPIO_SetLevel(m_gpioMotorN, PINLEVEL_HIGH);
+                     
+                 Ql_Sleep(20);    
+                 
+                 if (1 == Ql_GPIO_GetLevel(m_gpioMotorP))
+                     Ql_GPIO_SetLevel(m_gpioMotorP, PINLEVEL_LOW);
+             }
+             else if (CTRL_STOP == m_MotorWd)
+             {
+                 if (1 == Ql_GPIO_GetLevel(m_gpioMotorN))
+                     Ql_GPIO_SetLevel(m_gpioMotorN, PINLEVEL_LOW);
+                     
+                 Ql_Sleep(20);    
+                 
+                 if (1 == Ql_GPIO_GetLevel(m_gpioMotorP))
+                     Ql_GPIO_SetLevel(m_gpioMotorP, PINLEVEL_LOW);
+             }
+             m_CtrlCnt = m_CtrlCnt +1;
+             */
+        }
+    }
+
+    // send data to server periodic
+    if (UDP_TIMER_TXID == timerId && 3 == m_ProcessStage)
+    {
+        s32 ret;
+        
+        m_send_buf[0]=0x8E;
+        m_send_buf[1]=0x88;
+        m_send_buf[7]=0;
+        m_send_buf[8]=0xBB;
+        m_send_buf[9]=0x2;
+        m_send_buf[10]=m_MotorWd;
+       // m_send_buf[11]=m_LightWd;
+        m_send_buf[11]=Ql_GPIO_GetLevel(m_gpioLight);
+        m_send_buf[13]=0x8F;
+        for(int i=0;i<5;i++)
+        {
+            m_send_buf[2+i]=(m_IMEI[5+2*i]-'0')*10+(m_IMEI[6+2*i]-'0');
+        }
+        m_send_buf[12]=cal_Xor(m_send_buf+1,11);
+        
+        APP_DEBUG("<-- Send data: IP=%d,%d,%d,%d, U32_IP= %x,port=%d -->\r\n",m_SrvIpAddr[0],m_SrvIpAddr[1],m_SrvIpAddr[2],m_SrvIpAddr[3],m_SrvIpAddrU32, m_SrvPort);
+        APP_DEBUG("<--Txbuff : %x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,-->\r\n",m_send_buf[0],m_send_buf[1],m_send_buf[2],m_send_buf[3],m_send_buf[4],m_send_buf[5],m_send_buf[6],m_send_buf[7],m_send_buf[8],m_send_buf[9],m_send_buf[10],m_send_buf[11],m_send_buf[12],m_send_buf[13]);
+
+
+        ret = Ql_SOC_SendTo(m_SocketId, m_send_buf, 14, m_SrvIpAddrU32, m_SrvPort);
+        if(ret == SEND_BUFFER_LEN)//send compelete
+        {
+            APP_DEBUG("<-- Send data successfully -->\r\n");
+        }
+        else if(ret == SOC_WOULDBLOCK)
+        {
+            APP_DEBUG("<-- Sending data....-->\r\n");
+        }
+        else
+        {
+            APP_DEBUG("<-- Sending data failed!-->\r\n");
+        }
+
+    }
+}
+
+// This callback function is invoked when GPRS drops down. The cause is in "errCode".
+//
+static void Callback_GPRS_Deactived(u8 contextId, s32 errCode, void* customParam )
+{
+    if (errCode == SOC_SUCCESS)
+    {
+        APP_DEBUG("<--CallBack: deactivated GPRS successfully.-->\r\n");
+    }else{
+        APP_DEBUG("<--CallBack: fail to deactivate GPRS, cause=%d)-->\r\n", errCode);
+    }
+    if (1 == m_GprsActState)
+    {
+        m_GprsActState = 0;
+        APP_DEBUG("<-- GPRS drops down -->\r\n");
+    }
+}
+
+
+static void Callback_Socket_Connect(s32 socketId, s32 errCode, void* customParam )
+{
+    APP_DEBUG("<--CallBack: connect socket.-->\r\n");
+    if (errCode == SOC_SUCCESS)
+    {
+        APP_DEBUG("<--Callback: socket connect successfully.-->\r\n");
+    }else
+    {
+        APP_DEBUG("<--Callback: socket connect failure,(socketId=%d),errCode=%d-->\r\n",socketId,errCode);
+        Ql_SOC_Close(socketId);
+    }
+}
+
+
+// This callback function is invoked when the socket connection is disconnected by server or network.
+//
+static void Callback_Socket_Close(s32 socketId, s32 errCode, void* customParam )
+{
+    APP_DEBUG("<--CallBack: close socket.-->\r\n");
+    if (errCode == SOC_SUCCESS)
+    {
+        APP_DEBUG("<--CallBack: close socket successfully.-->\r\n");
+    }
+    else if(errCode == SOC_BEARER_FAIL)
+    {
+        APP_DEBUG("<--CallBack: fail to close socket,(socketId=%d,error_cause=%d)-->\r\n", socketId, errCode);
+    }else{
+        APP_DEBUG("<--CallBack: close socket failure,(socketId=%d,error_cause=%d)-->\r\n", socketId, errCode);
+    }
+    if (1 == m_SocketConnState)
+    {
+        APP_DEBUG("<-- Socket connection is disconnected -->\r\n");
+        APP_DEBUG("<-- Close socket at module side -->\r\n");
+        Ql_SOC_Close(socketId);
+        m_SocketConnState = 0;
+    }
+}
+
+
+static void Chk_StartPack()
+{
+    APP_DEBUG("<--Rxbuf: ");
+    for (int i=0;i<sizeof(m_recv_buf);i++)
+    {
+        APP_DEBUG("%x, ",m_recv_buf[i]);
+    }
+    APP_DEBUG(" -->\r\n");
+    
+    bool ChkOk = TRUE;
+    s32 Idx = 7;
+    ChkOk = ChkOk && (0 == m_recv_buf[Idx+0]) && (0xAB == m_recv_buf[Idx+1]);
+    if (ChkOk)
+    {
+        if ((0xA1 == m_recv_buf[Idx+7]) && (m_recv_buf[Idx+13]== cal_Xor(m_recv_buf+Idx+4,9)))   // start ctrl
+        {
+            APP_DEBUG("<-- start control -->\r\n");
+
+            m_newCmd[0] = 0x33;   // start control word
+            m_newCmd[1] = m_recv_buf[Idx+9];
+            m_newCmd[2] = m_recv_buf[Idx+10];
+            m_newCmd[3] = m_recv_buf[Idx+11];
+            m_newCmd[4] = m_recv_buf[Idx+12];
+            Ql_GPIO_SetLevel(m_gpioMotorP, PINLEVEL_HIGH);
+            
+            Ql_Timer_Start(UDP_TIMER_TXID, UDP_TIMER_TXPERIOD, TRUE);
+            Ql_Timer_Start(UDP_TIMER_CTRL, UDP_TIMER_CTRLPERIOD, TRUE);
+            
+        }
+        if ((0xA2 == m_recv_buf[Idx+7]) && (m_recv_buf[Idx+9]== cal_Xor(m_recv_buf+Idx+4,5)))   // stop ctrl
+        {
+            APP_DEBUG("<-- stop control -->\r\n");  
+            m_newCmd[0] = 0x55;   // stop control word
+            //m_StartCtrl = CTRL_STOP;
+            //m_LightWd = CTRL_STOP;
+        }
+    }
+}
+
+
+// This callback function is invoked when socket data arrives.
+// The program should call Ql_SOC_Recv to read all data out of the socket buffer.
+//
+static void Callback_Socket_Read(s32 socketId, s32 errCode, void* customParam )
+{
+    s32 ret;
+    u8 srv_address[5] ={0};
+    u16 srv_port;
+    
+    APP_DEBUG("<-- Socket_Read.-->\r\n");
+    if (errCode)
+    {
+        APP_DEBUG("<--CallBack: socket read failure,(sock=%d,error=%d)-->\r\n",socketId,errCode);
+        APP_DEBUG("<-- Close socket.-->\r\n");
+        Ql_SOC_Close(socketId);
+        m_SocketId = -1;
+        return;
+    }
+
+    Ql_memset(m_recv_buf, 0, RECV_BUFFER_LEN);
+    do
+    {
+        //ret = Ql_SOC_RecvFrom(socketId, m_recv_buf, RECV_BUFFER_LEN, (u32*)srv_address, &srv_port);
+        ret = Ql_SOC_RecvFrom(socketId, m_recv_buf, 1024, (u32*)srv_address, &srv_port);
+        APP_DEBUG("<--UDP Server:ip=%d.%d.%d.%d, port=%d.-->\r\n",srv_address[0],srv_address[1],srv_address[2],srv_address[3],srv_port);
+        
+        if((ret < SOC_SUCCESS) && (ret != SOC_WOULDBLOCK))
+        {
+            APP_DEBUG("<-- Fail to receive data, cause=%d.-->\r\n",ret);
+            APP_DEBUG("<-- Close socket.-->\r\n");
+            Ql_SOC_Close(socketId);
+            m_SocketId = -1;
+            break;
+        }
+        else if(SOC_WOULDBLOCK == ret)  // Read finish
+        {
+            //wait next CallBack_socket_read
+            Chk_StartPack();
+            break;
+        }
+        else if (RECV_BUFFER_LEN == ret || RECV_BUFFER_STOP_LEN == ret)  // receive command
+        {
+            //APP_DEBUG("<--Receive data from sock(%d),len(%d).-->\r\n",socketId,ret);
+            Chk_StartPack();
+            break;
+        }
+    } while (TRUE);
+}
+
+
+// This callback function is invoked in the following case:
+// The return value is less than the data length to send when calling Ql_SOC_Send(), which indicates
+// the socket buffer is full. Application should stop sending socket data till this callback function
+// is invoked, which indicates application can continue to send data to socket.
+static void Callback_Socket_Write(s32 socketId, s32 errCode, void* customParam)
+{
+    if (errCode < 0)
+    {
+        APP_DEBUG("<-- Socket error(error code:%d), close socket.-->\r\n", errCode);
+        Ql_SOC_Close(socketId);
+        m_SocketId = -1;
+    }else{
+        APP_DEBUG("<-- You can continue to send data to socket -->\r\n");
+    }
+}
+
+static void callback_GetIpByName(u8 contexId, u8 requestId, s32 errCode, u32 ipAddrCnt, u32* ipAddr)
+{
+    u8* ipSegment = (u8*)ipAddr;
+
+    Ql_memset(m_SrvIpAddr,0,4);
+
+    if (SOC_SUCCESS == errCode)
+    {
+        m_SrvIpAddr[0]= ipSegment[0];
+        m_SrvIpAddr[1]= ipSegment[1];
+        m_SrvIpAddr[2]= ipSegment[2];
+        m_SrvIpAddr[3]= ipSegment[3];
+       // m_SrvIpAddr[0]= 47;
+       // m_SrvIpAddr[1]= 97;
+       // m_SrvIpAddr[2]= 212;
+       // m_SrvIpAddr[3]= 1;
+        
+        m_SrvIpAddrU32= (u32)m_SrvIpAddr;
+        APP_DEBUG("<-- Convert HostName to IP successfully,m_ipaddress=%d,%d,%d,%d,U32=%x -->\r\n",m_SrvIpAddr[0],m_SrvIpAddr[1],m_SrvIpAddr[2],m_SrvIpAddr[3],m_SrvIpAddrU32);
+        TxData_Pack();
+
+        m_ProcessStage = 2;
+    }
+}
+
+static s32 ATRsp_CNUM_Handler(char* line, u32 len, void* param)
+{
+    //APP_DEBUG("<-- callback CNUM: %s -->\r\n",line);
+    char* pHead = Ql_RIL_FindString(line, len, "+CNUM:");
+    if (pHead)
+    {
+        //Ql_sscanf(pHead,"%*[^: \"]: \"%[^\"\r\n]", (char*)param);
+        //APP_DEBUG("<-- pHead: %s -->\r\n",pHead);
+        char* chr_ptr = (char* )param;
+        //char strTmp[11];
+        char* p1 = NULL;
+        //char* p2 = NULL;
+
+        //Ql_memset(chr_ptr, 0x0, sizeof(strTmp));
+        p1 = Ql_strstr(pHead, "+86");
+       // APP_DEBUG("<-- p1: %s -->\r\n",p1);
+        Ql_memcpy(chr_ptr, p1+3, 11);
+        //APP_DEBUG("<-- chr_ptr: %s -->\r\n",chr_ptr);
+        
+        return  RIL_ATRSP_CONTINUE; // wait for OK
+    }
+
+    pHead = Ql_RIL_FindLine(line, len, "OK"); // find <CR><LF>OK<CR><LF>, <CR>OK<CR>，<LF>OK<LF>
+    if (pHead)
+    {
+        return RIL_ATRSP_SUCCESS;
+    }
+
+    pHead = Ql_RIL_FindLine(line, len, "ERROR");// find <CR><LF>ERROR<CR><LF>, <CR>ERROR<CR>，<LF>ERROR<LF>
+    if (pHead)
+    {
+        return RIL_ATRSP_FAILED;
+    }
+
+    pHead = Ql_RIL_FindString(line, len, "+CME ERROR:");//fail
+    if (pHead)
+    {
+        return RIL_ATRSP_FAILED;
+    }
+
+    return RIL_ATRSP_CONTINUE; //continue wait
+}
+
+static s32 RIL_SIM_GetSNID(char* cnum)
+{
+    char strAT[] = "AT+CNUM\0";
+    if (NULL == cnum)
+    {
+        return RIL_AT_INVALID_PARAM;
+    }
+    return Ql_RIL_SendATCmd(strAT,Ql_strlen(strAT), ATRsp_CNUM_Handler,(void*)cnum, 0);
+}
+
+#endif // __CUSTOMER_CODE__

@@ -1,0 +1,4 @@
+process_begin: CreateProcess(NULL, C:\MentorGraphics\Sourcery_CodeBench_Lite_for_ARM_EABI/bin/cs-rm.exe -f build\gcc/APPGS3MDM32A01.bin, ...) failed.
+make (e=2): 系统找不到指定的文件。
+make.exe[1]: *** [CreateDir] Error 2
+make: *** [all] Error 2
